@@ -1,0 +1,110 @@
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace {{NAMESPACE}}.Entities;
+
+/// <summary>
+/// 客戶在 mockup 網頁元素上留下的單一註解 thread。
+/// 由 inline annotation widget 在客戶按下「送出」時建立。
+/// 後續客戶/Claude 的回覆透過 <see cref="FeedbackMessage"/> 串成對話。
+///
+/// 設計依據：docs/feedback-widget-phase0-spike.md（spike 已驗證 selector 反查可行）
+/// </summary>
+[Table("FEEDBACK_THREADS")]
+public class FeedbackThread
+{
+    /// <summary>Guid 主鍵（外露給 widget 與 Claude，不用 int auto-increment 以免被列舉）</summary>
+    [Key]
+    [Column("Id")]
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    /// <summary>客戶 session 識別（widget 第一次載入發的 cookie），同一客戶的所有 thread 共用</summary>
+    [Required]
+    [Column("SessionId")]
+    [MaxLength(64)]
+    public string SessionId { get; set; } = string.Empty;
+
+    /// <summary>留評論時的完整 URL（含 querystring）</summary>
+    [Required]
+    [Column("PageUrl")]
+    [MaxLength(1000)]
+    public string PageUrl { get; set; } = string.Empty;
+
+    /// <summary>留評論時的 path（給 Claude triage 快速分類用）</summary>
+    [Required]
+    [Column("Route")]
+    [MaxLength(500)]
+    public string Route { get; set; } = string.Empty;
+
+    /// <summary>CSS path（widget 端 cssPath() 產生）</summary>
+    [Column("Selector")]
+    [MaxLength(2000)]
+    public string Selector { get; set; } = string.Empty;
+
+    /// <summary>元素 outerHTML 截至 1500 chars，給 Claude 看 DOM 上下文</summary>
+    [Column("OuterHtml")]
+    public string OuterHtml { get; set; } = string.Empty;
+
+    /// <summary>JSON：{x,y,w,h} 元素位置，畫面 scroll 還原用</summary>
+    [Column("BboxJson")]
+    [MaxLength(200)]
+    public string BboxJson { get; set; } = "{}";
+
+    /// <summary>JSON：{w,h} 客戶當下的 viewport 大小，截圖比例用</summary>
+    [Column("ViewportJson")]
+    [MaxLength(100)]
+    public string ViewportJson { get; set; } = "{}";
+
+    /// <summary>JSON：給 triage 用的強訊號集合
+    /// （customClasses / parentCustomClasses / visibleText / inlineStyle / ariaLabel / role / dataTestId / tagName）
+    /// 詳見 widget 端 extractSignals() 與 spike report</summary>
+    [Column("SignalsJson")]
+    public string SignalsJson { get; set; } = "{}";
+
+    /// <summary>部署 SHA（widget 從 window.__DEPLOY_SHA__ 取，無就 null）</summary>
+    [Column("DeploymentSha")]
+    [MaxLength(64)]
+    public string? DeploymentSha { get; set; }
+
+    /// <summary>截圖 base64（Phase 1 widget 暫不送，預留給 Phase 2+）</summary>
+    [Column("ScreenshotB64")]
+    public string? ScreenshotB64 { get; set; }
+
+    /// <summary>thread 狀態</summary>
+    [Required]
+    [Column("Status")]
+    [MaxLength(20)]
+    public string Status { get; set; } = FeedbackThreadStatus.Open;
+
+    /// <summary>Claude 處理完開的 PR URL（status=Done 時填）</summary>
+    [Column("PrUrl")]
+    [MaxLength(500)]
+    public string? PrUrl { get; set; }
+
+    /// <summary>建立時間 = 客戶第一次按送出</summary>
+    [Column("CreatedAt")]
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    /// <summary>最後活動時間（新訊息或狀態變更時更新）</summary>
+    [Column("UpdatedAt")]
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+    /// <summary>導覽：thread 上的所有 messages（含開頭的客戶 comment）</summary>
+    public ICollection<FeedbackMessage> Messages { get; set; } = new List<FeedbackMessage>();
+}
+
+/// <summary>
+/// FeedbackThread 狀態常數（不用 enum 是因為現有 codebase 多用字串欄位 + 常數類別，
+/// 且方便 widget JSON 與 Claude triage 直接序列化字串）。
+/// </summary>
+public static class FeedbackThreadStatus
+{
+    /// <summary>剛建立，等 Claude 處理</summary>
+    public const string Open = "open";
+
+    /// <summary>Claude 看不懂、需要客戶回答更多細節</summary>
+    public const string Clarification = "clarification";
+
+    /// <summary>Claude 開好 PR，等 review 或已合</summary>
+    public const string Done = "done";
+}

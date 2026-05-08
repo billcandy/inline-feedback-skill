@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -ksI*)",
+      "Bash(curl -ks*)",
+      "Bash(curl -s*)",
+      "Bash(jq:*)",
+      "Bash(rg:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh repo:*)",
+      "Bash(git checkout -b:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
+    ]
+  },
+  "env": {
+    "FEEDBACK_API_BASE": "https://YOUR-APP.up.railway.app",
+    "FEEDBACK_SERVICE_TOKEN": "PASTE_YOUR_64_CHAR_HEX_TOKEN_HERE",
+    "FEEDBACK_AUTOFIX_MODE": "propose"
+  }
+}

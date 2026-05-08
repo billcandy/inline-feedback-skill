@@ -1,0 +1,197 @@
+# Feedback Triage Runbook
+
+跟客戶 demo 完 mockup 之後，用這個 runbook 處理客戶留下的 inline 註解。
+
+## 一鍵跑：`/triage-feedback`
+
+在 Claude Code 對話視窗打 `/triage-feedback` 即可。**這是唯一的 slash
+command**，三種狀況一次處理完：
+
+| 狀況 | 行為 |
+|---|---|
+| 客戶剛留（`open`） | 寫 Fix Proposal 貼回 thread（propose mode 預設）|
+| 客戶按了「ok / 同意 / yes」，上一則是 AI 提案 | 視為 approve → 動手 fix → `gh pr create` → 標 `done` |
+| 客戶在 `clarification` 裡補了新訊息 | 重新評估，再 propose 或再追問 |
+
+它一次掃完所有 `open` + `clarification` 的 thread，無需區分。
+
+### 何時跑？
+
+- ✅ Demo 結束後馬上跑：把客戶當下留的 thread 都吃下來、回提案
+- ✅ 隔天再跑一次：客戶看完提案、按了 approve 的，這次會自動 fix + 開 PR
+- ⚠️ 不必每分鐘跑（沒 webhook，純 pull；每天 2-3 次足夠）
+
+如果想自動化，用 `/loop 1h /triage-feedback`（需 Claude Code 視窗開著、消耗額度）。
+
+---
+
+## 跑之前要設的環境變數
+
+3 個環境變數要讓 Claude Code 看得到：
+
+| 變數 | 值 |
+|---|---|
+| `FEEDBACK_API_BASE` | `http://localhost:5000`（本地）或 `https://<你>.up.railway.app` |
+| `FEEDBACK_SERVICE_TOKEN` | 跟 Railway Variables 那邊一致 |
+| `FEEDBACK_AUTOFIX_MODE` | `propose`（預設，可省略）或 `direct` |
+
+**推薦做法（做一次就好）**：見下節「客戶端 zero-export 設定」。
+
+**臨時跑（單次 shell）**：
+
+```bash
+export FEEDBACK_API_BASE="https://<your>.up.railway.app"
+export FEEDBACK_SERVICE_TOKEN="<Railway 那串>"
+```
+
+---
+
+## 客戶端 zero-export 設定（Phase 4.6）
+
+**痛點**：每次新 shell 都要 export 兩條 env vars，太麻煩。
+
+**解法**：把 env 寫進 `.claude/settings.local.json`，Claude Code 會自動注入到
+每個 Bash tool call 的環境變數，再也不用 export。
+
+該檔已存在（gitignored，per-Bill 個人設定，不會 commit 出去）。
+
+### 步驟
+
+1. 打開：
+   ```
+   /Users/kuoluntang/Dropbox/1.AI_coding/00.ntust_VB/.claude/settings.local.json
+   ```
+
+2. 在最外層 `}` 之前、`permissions` 區塊之後，加一個 `env` 區塊：
+
+   ```json
+   {
+     "permissions": {
+       "allow": [ ... 既有 70 條規則不動 ... ]
+     },
+     "env": {
+       "FEEDBACK_API_BASE": "https://ntust-schoolfees-production.up.railway.app",
+       "FEEDBACK_SERVICE_TOKEN": "<貼進 Railway Variables 那串 token>",
+       "FEEDBACK_AUTOFIX_MODE": "propose"
+     }
+   }
+   ```
+
+   ⚠️ 注意 `permissions` 和 `env` 之間要有逗號。
+
+3. 存檔。
+
+4. **重啟 Claude Code**（cmd+Q 整個關掉再開，或 `/exit` 後重開）。新 session
+   才會載入 env vars。
+
+### 驗證
+
+新 session 起來後，問我「跑 `echo $FEEDBACK_API_BASE`」，應該回傳 production
+URL。如果空 → 重啟沒生效，再 cmd+Q 一次。
+
+驗證通了就直接打 `/triage-feedback`，再也不用 export。
+
+### 排程自動拉（可選）
+
+如果想完全不打 slash command，設好上面之後可以再下：
+
+```
+/loop 30m /triage-feedback
+```
+
+每 30 分鐘自動跑一次。注意：
+- Claude Code 視窗必須開著、不能關閉
+- 每跑一次都會吃 API 額度
+- 客戶留 comment 後最多等 30 分鐘才被處理
+
+實際上 demo 結束、客戶按完所有 thread 之後**手動跑一次**最有效率，不用持續
+polling。
+
+### 安全護欄
+
+- `.claude/settings.local.json` 已被 git ignore，不會 commit 出去
+- macOS 上 `~/.claude/` 是個人 user space，整體只有自己讀得到
+- 想要 token 加密儲存（macOS Keychain）→ 等 Phase 5 抽 Skill 時內建
+
+## 兩種模式何時用哪個
+
+| 情境 | mode | 理由 |
+|---|---|---|
+| 一般客戶 demo | `propose` | 客戶看得到 Claude 的修改方案、按 OK 才動手；不會被冷不防改錯 |
+| 你已經自己看過所有 thread、確定要批次處理 | `direct` | 跳過提案環節省時間 |
+| 客戶不在線、改的是純 CSS / typo | `direct` | 風險低、可逆 |
+| 改動牽涉業務邏輯 / migration / schema | 永遠 `propose` | 即便客戶說「都可以」也別自己決定 |
+
+## 客戶在 sidebar 看到什麼
+
+每個 thread 會經歷以下幾種狀態：
+
+```
+🟡 處理中   (open)            ← 客戶剛留，等 Claude 處理
+🔵 待補充   (clarification)   ← Claude 看不懂在追問
+✅ 已完工   (done) + PR url   ← Claude 已開 PR
+```
+
+客戶可以：
+- 在 thread 裡 reply（POST kind=comment）
+- 看 Claude 的提案 / 追問訊息
+
+## 操作流程（典型）
+
+```
+你：跟客戶開 demo 會議
+        ↓
+客戶：在網頁戳元素留「這裡字太小、按鈕色不對、…」
+        ↓
+你：對話結束，打開 Claude Code 終端
+        ↓
+你：/triage-feedback
+        ↓
+Claude：拉了 12 筆 thread
+        ├─ 8 筆改 CSS / typo → 提案 8 篇
+        ├─ 2 筆要改 layout → 追問 2 個
+        └─ 2 筆改 logic → 提案 2 篇（建議 review）
+        ↓
+你：跟客戶共享 sidebar，請他逐筆 approve / 補充
+        ↓
+你：再跑一次 /triage-feedback
+        ↓
+Claude：8 筆 approve 的 → 動手開 8 個 PR
+        ↓
+你：merge PR → Railway 自動 redeploy → 客戶看到改完的網站
+```
+
+## 失敗復原
+
+### 跑到一半被打斷
+
+slash command 是冪等的：每筆 thread 只看 `status=open` 或 `clarification`。
+重跑會跳過已 `done` 的、繼續處理剩下的。直接再跑一次就好。
+
+### Claude 開錯 PR / 改錯方向
+
+- 拒絕 merge 那個 PR、close it
+- 在對應 thread 上 POST `kind=clarification` 寫具體哪裡錯（用 widget sidebar 的 reply 就好）
+- 把 thread status 設回 `open`：
+  ```bash
+  curl -X PATCH -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+    "$FEEDBACK_API_BASE/api/feedback/$TID" \
+    -d '{"status":"open","pr_url":""}'
+  ```
+- 下次 `/triage-feedback` 會重新 triage
+
+### Claude 卡在「找不到對應元件」
+
+代表 selector 反查命中率太低。檢查：
+- 該頁是否 MudBlazor 元件多、自訂 class 少 → 加 `data-component-source` 屬性
+- 該頁的 Razor 檔是否含有 dynamic 資料的字串（會誤導 grep）→ 換 selector
+  策略
+
+如果頻繁失敗，回頭看 Phase 0 spike 的 fallback：手工標 `data-component-source`。
+
+## 不在這次 runbook 範圍
+
+- 多客戶 / multi-tenant：目前單一 token 只能切一個 demo（之後 Skill 化再加）
+- 通知工程師（Slack / email）：目前是純 pull（你跑 slash command 才會 triage）
+- 截圖：widget 目前不送，沒辦法看「客戶當下看到的畫面」是什麼樣子；
+  Phase 5 會補 html2canvas

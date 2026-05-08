@@ -1,0 +1,375 @@
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.EntityFrameworkCore;
+using {{DOMAIN_NAMESPACE}}.Entities;
+using {{INFRA_NAMESPACE}}.Data;
+
+namespace {{APP_NAMESPACE}}.Feedback;
+
+/// <summary>
+/// Inline annotation feedback API（Minimal API 風格）
+///
+/// 5 個 endpoints：
+///   POST   /api/feedback                 → 客戶按送出（建 thread + 第一筆 comment）
+///   POST   /api/feedback/{id}/messages   → 客戶或 Claude 加新 message
+///   GET    /api/feedback                 → 客戶看自己 session 的 thread 列表（用 cookie 過濾）
+///                                           或 Claude（帶 service token）看全部
+///   GET    /api/feedback/{id}            → 取單一 thread 含所有 messages
+///   PATCH  /api/feedback/{id}            → 改 status（清楚→clarification / 完工→done）
+///                                           僅 Claude（帶 service token）能呼叫
+///
+/// 雙 token 設計：
+///   - 客戶：feedback-session cookie（widget 第一次載入時自動發）
+///   - Claude：X-Feedback-Service-Token header（從環境變數 FEEDBACK_SERVICE_TOKEN 讀）
+///
+/// 設計依據：plan @ ~/.claude/plans/image-1-icon-partitioned-hopper.md Phase 2
+/// </summary>
+public static class FeedbackEndpoints
+{
+    private const string SessionCookie = "feedback-session";
+    private const string ServiceTokenHeader = "X-Feedback-Service-Token";
+    private const int OuterHtmlMaxLen = 1500;
+    private const int CommentMaxLen = 4000;
+
+    public static IEndpointRouteBuilder MapFeedbackEndpoints(this IEndpointRouteBuilder app, string? serviceToken)
+    {
+        app.MapPost("/api/feedback", (HttpContext ctx, {{DB_CONTEXT}} db, CreateThreadDto body)
+            => CreateAsync(ctx, db, body));
+
+        app.MapPost("/api/feedback/{id:guid}/messages", (HttpContext ctx, {{DB_CONTEXT}} db, Guid id, AddMessageDto body)
+            => AddMessageAsync(ctx, db, id, body, serviceToken));
+
+        app.MapGet("/api/feedback", (HttpContext ctx, {{DB_CONTEXT}} db, string? status)
+            => ListAsync(ctx, db, status, serviceToken));
+
+        app.MapGet("/api/feedback/{id:guid}", (HttpContext ctx, {{DB_CONTEXT}} db, Guid id)
+            => GetAsync(ctx, db, id, serviceToken));
+
+        app.MapPatch("/api/feedback/{id:guid}", (HttpContext ctx, {{DB_CONTEXT}} db, Guid id, UpdateThreadDto body)
+            => UpdateAsync(ctx, db, id, body, serviceToken));
+
+        return app;
+    }
+
+    // -------------------------------------------------------------------
+    // POST /api/feedback — 建 thread + 第一筆客戶 comment
+    // -------------------------------------------------------------------
+    public static async Task<IResult> CreateAsync(HttpContext ctx, {{DB_CONTEXT}} db, CreateThreadDto body)
+    {
+        var sessionId = ctx.Request.Cookies[SessionCookie];
+        if (string.IsNullOrWhiteSpace(sessionId)) sessionId = body.SessionId;
+        if (string.IsNullOrWhiteSpace(sessionId))
+            return Results.BadRequest(new { error = "missing feedback-session cookie" });
+
+        if (string.IsNullOrWhiteSpace(body.Comment))
+            return Results.BadRequest(new { error = "comment required" });
+
+        var thread = new FeedbackThread
+        {
+            SessionId = sessionId,
+            PageUrl = Truncate(body.PageUrl, 1000),
+            Route = Truncate(body.Route, 500),
+            Selector = Truncate(body.Selector, 2000),
+            OuterHtml = Truncate(body.OuterHtml, OuterHtmlMaxLen),
+            BboxJson = Truncate(body.BboxJson, 200),
+            ViewportJson = Truncate(body.ViewportJson, 100),
+            SignalsJson = body.SignalsJson ?? "{}",
+            DeploymentSha = Truncate(body.DeploymentSha, 64),
+            ScreenshotB64 = body.ScreenshotB64,
+            Status = FeedbackThreadStatus.Open,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        var firstMessage = new FeedbackMessage
+        {
+            ThreadId = thread.Id,
+            AuthorType = FeedbackAuthorType.Customer,
+            Kind = FeedbackMessageKind.Comment,
+            Body = Truncate(body.Comment, CommentMaxLen),
+            ScreenshotB64 = body.ScreenshotB64,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        db.FeedbackThreads.Add(thread);
+        db.FeedbackMessages.Add(firstMessage);
+        await db.SaveChangesAsync();
+
+        return Results.Created($"/api/feedback/{thread.Id}", new
+        {
+            id = thread.Id,
+            status = thread.Status,
+            created_at = thread.CreatedAt
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // POST /api/feedback/{id}/messages — 客戶或 Claude 加新 message
+    // -------------------------------------------------------------------
+    public static async Task<IResult> AddMessageAsync(HttpContext ctx, {{DB_CONTEXT}} db, Guid id, AddMessageDto body, string? serviceToken)
+    {
+        var thread = await db.FeedbackThreads.FirstOrDefaultAsync(t => t.Id == id);
+        if (thread is null) return Results.NotFound();
+
+        var isClaude = HasServiceToken(ctx, serviceToken);
+        var sessionId = ctx.Request.Cookies[SessionCookie];
+
+        // 客戶只能在自己的 thread 加 message
+        if (!isClaude && thread.SessionId != sessionId)
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+
+        if (string.IsNullOrWhiteSpace(body.Body))
+            return Results.BadRequest(new { error = "body required" });
+
+        var msg = new FeedbackMessage
+        {
+            ThreadId = thread.Id,
+            AuthorType = isClaude ? FeedbackAuthorType.Claude : FeedbackAuthorType.Customer,
+            Kind = NormalizeKind(body.Kind, isClaude),
+            Body = Truncate(body.Body, CommentMaxLen),
+            ScreenshotB64 = body.ScreenshotB64,
+            CreatedAt = DateTime.UtcNow
+        };
+
+        thread.UpdatedAt = DateTime.UtcNow;
+        db.FeedbackMessages.Add(msg);
+        await db.SaveChangesAsync();
+
+        return Results.Created($"/api/feedback/{id}/messages/{msg.Id}", new
+        {
+            id = msg.Id,
+            author_type = msg.AuthorType,
+            kind = msg.Kind,
+            created_at = msg.CreatedAt
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // GET /api/feedback — list（客戶看自己的、Claude 看全部 + status filter）
+    // -------------------------------------------------------------------
+    public static async Task<IResult> ListAsync(HttpContext ctx, {{DB_CONTEXT}} db, string? status, string? serviceToken)
+    {
+        var isClaude = HasServiceToken(ctx, serviceToken);
+        var sessionId = ctx.Request.Cookies[SessionCookie];
+
+        var q = db.FeedbackThreads.AsNoTracking().AsQueryable();
+
+        if (!isClaude)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId))
+                return Results.Ok(Array.Empty<object>());     // 沒 cookie → 空清單
+            q = q.Where(t => t.SessionId == sessionId);
+        }
+
+        if (!string.IsNullOrWhiteSpace(status))
+            q = q.Where(t => t.Status == status);
+
+        var rows = await q
+            .OrderByDescending(t => t.UpdatedAt)
+            .Take(200)
+            .Select(t => new ThreadSummaryDto(
+                t.Id,
+                t.Route,
+                t.Selector,
+                t.SignalsJson,
+                t.Status,
+                t.PrUrl,
+                t.CreatedAt,
+                t.UpdatedAt,
+                t.Messages.Count
+            ))
+            .ToListAsync();
+
+        return Results.Ok(rows);
+    }
+
+    // -------------------------------------------------------------------
+    // GET /api/feedback/{id} — 單一 thread 含所有 messages
+    // -------------------------------------------------------------------
+    public static async Task<IResult> GetAsync(HttpContext ctx, {{DB_CONTEXT}} db, Guid id, string? serviceToken)
+    {
+        var thread = await db.FeedbackThreads.AsNoTracking().FirstOrDefaultAsync(t => t.Id == id);
+        if (thread is null) return Results.NotFound();
+
+        var isClaude = HasServiceToken(ctx, serviceToken);
+        var sessionId = ctx.Request.Cookies[SessionCookie];
+        if (!isClaude && thread.SessionId != sessionId)
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+
+        var messages = await db.FeedbackMessages.AsNoTracking()
+            .Where(m => m.ThreadId == id)
+            .OrderBy(m => m.CreatedAt)
+            .Select(m => new MessageDto(m.Id, m.AuthorType, m.Kind, m.Body, m.ScreenshotB64, m.CreatedAt))
+            .ToListAsync();
+
+        return Results.Ok(new ThreadDetailDto(
+            thread.Id,
+            thread.PageUrl,
+            thread.Route,
+            thread.Selector,
+            thread.OuterHtml,
+            thread.BboxJson,
+            thread.ViewportJson,
+            thread.SignalsJson,
+            thread.DeploymentSha,
+            thread.Status,
+            thread.PrUrl,
+            thread.CreatedAt,
+            thread.UpdatedAt,
+            messages
+        ));
+    }
+
+    // -------------------------------------------------------------------
+    // PATCH /api/feedback/{id} — 改狀態 / PR url
+    //   Claude（service token）：可任意改 status + pr_url
+    //   客戶（matching session cookie）：只能在自己的 thread 設 status=done
+    //     （客戶按 widget「標記完工」按鈕用）
+    // -------------------------------------------------------------------
+    public static async Task<IResult> UpdateAsync(HttpContext ctx, {{DB_CONTEXT}} db, Guid id, UpdateThreadDto body, string? serviceToken)
+    {
+        var thread = await db.FeedbackThreads.FirstOrDefaultAsync(t => t.Id == id);
+        if (thread is null) return Results.NotFound();
+
+        var isClaude = HasServiceToken(ctx, serviceToken);
+        var sessionId = ctx.Request.Cookies[SessionCookie];
+        var isOwner = !string.IsNullOrEmpty(sessionId) && thread.SessionId == sessionId;
+        if (!isClaude && !isOwner)
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+
+        if (!string.IsNullOrWhiteSpace(body.Status))
+        {
+            var s = body.Status.ToLowerInvariant();
+            if (s != FeedbackThreadStatus.Open && s != FeedbackThreadStatus.Clarification && s != FeedbackThreadStatus.Done)
+                return Results.BadRequest(new { error = $"invalid status: {body.Status}" });
+            // 客戶只能標 done，不能反向改 open/clarification（避免亂搗）
+            if (!isClaude && s != FeedbackThreadStatus.Done)
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            thread.Status = s;
+        }
+        // 客戶不可以改 PR url
+        if (body.PrUrl is not null)
+        {
+            if (!isClaude)
+                return Results.StatusCode(StatusCodes.Status403Forbidden);
+            thread.PrUrl = Truncate(body.PrUrl, 500);
+        }
+        // 客戶 + Claude 都可以改 customTitle（客戶 rename 自己的 thread；Claude
+        // triage 時偶爾也用得到）。寫進 SignalsJson 的 customTitle key，
+        // 避免動 schema。空字串 = 移除自訂標題。
+        if (body.CustomTitle is not null)
+        {
+            var trimmed = Truncate(body.CustomTitle.Trim(), 100);
+            thread.SignalsJson = MergeSignalsCustomTitle(thread.SignalsJson, trimmed);
+        }
+
+        thread.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync();
+
+        return Results.Ok(new { id = thread.Id, status = thread.Status, pr_url = thread.PrUrl });
+    }
+
+    // 把 customTitle 寫進 signalsJson 的 customTitle key（不破壞既有 signal 欄位）。
+    // 解析失敗 / 不是 object 就重建一個只有 customTitle 的 object。
+    private static string MergeSignalsCustomTitle(string currentJson, string newTitle)
+    {
+        try
+        {
+            var node = System.Text.Json.Nodes.JsonNode.Parse(currentJson);
+            if (node is System.Text.Json.Nodes.JsonObject obj)
+            {
+                if (string.IsNullOrEmpty(newTitle))
+                    obj.Remove("customTitle");
+                else
+                    obj["customTitle"] = newTitle;
+                return obj.ToJsonString();
+            }
+        }
+        catch { /* fall through to rebuild */ }
+        var fresh = new System.Text.Json.Nodes.JsonObject();
+        if (!string.IsNullOrEmpty(newTitle)) fresh["customTitle"] = newTitle;
+        return fresh.ToJsonString();
+    }
+
+    // -------------------------------------------------------------------
+    // helpers
+    // -------------------------------------------------------------------
+    private static bool HasServiceToken(HttpContext ctx, string? expected)
+    {
+        if (string.IsNullOrWhiteSpace(expected)) return false;
+        var got = ctx.Request.Headers[ServiceTokenHeader].ToString();
+        return !string.IsNullOrEmpty(got) && got == expected;
+    }
+
+    private static string Truncate(string? s, int max)
+        => string.IsNullOrEmpty(s) ? string.Empty : (s.Length <= max ? s : s.Substring(0, max));
+
+    private static string NormalizeKind(string? raw, bool isClaude)
+    {
+        var k = (raw ?? "").Trim().ToLowerInvariant();
+        var allowed = isClaude
+            ? new[] { FeedbackMessageKind.Clarification, FeedbackMessageKind.Proposal, FeedbackMessageKind.DoneNote, FeedbackMessageKind.Comment }
+            : new[] { FeedbackMessageKind.Comment, FeedbackMessageKind.Approval };
+        return allowed.Contains(k) ? k : (isClaude ? FeedbackMessageKind.Comment : FeedbackMessageKind.Comment);
+    }
+}
+
+// =====================================================================
+// DTOs
+// =====================================================================
+public record CreateThreadDto(
+    string? SessionId,
+    string PageUrl,
+    string Route,
+    string Selector,
+    string OuterHtml,
+    string BboxJson,
+    string ViewportJson,
+    string? SignalsJson,
+    string? DeploymentSha,
+    string? ScreenshotB64,
+    string Comment
+);
+
+public record AddMessageDto(string? Kind, string Body, string? ScreenshotB64);
+
+public record UpdateThreadDto(string? Status, string? PrUrl, string? CustomTitle = null);
+
+public record ThreadSummaryDto(
+    Guid Id,
+    string Route,
+    string Selector,
+    string SignalsJson,
+    string Status,
+    string? PrUrl,
+    DateTime CreatedAt,
+    DateTime UpdatedAt,
+    int MessageCount
+);
+
+public record MessageDto(
+    Guid Id,
+    string AuthorType,
+    string Kind,
+    string Body,
+    string? ScreenshotB64,
+    DateTime CreatedAt
+);
+
+public record ThreadDetailDto(
+    Guid Id,
+    string PageUrl,
+    string Route,
+    string Selector,
+    string OuterHtml,
+    string BboxJson,
+    string ViewportJson,
+    string SignalsJson,
+    string? DeploymentSha,
+    string Status,
+    string? PrUrl,
+    DateTime CreatedAt,
+    DateTime UpdatedAt,
+    List<MessageDto> Messages
+);

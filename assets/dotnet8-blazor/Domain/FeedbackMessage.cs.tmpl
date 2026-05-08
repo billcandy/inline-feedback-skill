@@ -1,0 +1,74 @@
+using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace {{NAMESPACE}}.Entities;
+
+/// <summary>
+/// FeedbackThread 上的單一 message，順序串成對話。
+/// 第一筆通常是客戶的 comment（widget 建立 thread 同時插入），
+/// 接著可能是 Claude 的 clarification 追問或 proposal 修改方案。
+/// </summary>
+[Table("FEEDBACK_MESSAGES")]
+public class FeedbackMessage
+{
+    [Key]
+    [Column("Id")]
+    public Guid Id { get; set; } = Guid.NewGuid();
+
+    /// <summary>所屬 thread</summary>
+    [Required]
+    [Column("ThreadId")]
+    public Guid ThreadId { get; set; }
+
+    /// <summary>作者類型：customer 或 claude</summary>
+    [Required]
+    [Column("AuthorType")]
+    [MaxLength(20)]
+    public string AuthorType { get; set; } = FeedbackAuthorType.Customer;
+
+    /// <summary>訊息類型：comment / clarification / proposal / approval / done-note</summary>
+    [Required]
+    [Column("Kind")]
+    [MaxLength(20)]
+    public string Kind { get; set; } = FeedbackMessageKind.Comment;
+
+    /// <summary>訊息內容（markdown 可，給 Claude proposal 使用）</summary>
+    [Required]
+    [Column("Body")]
+    public string Body { get; set; } = string.Empty;
+
+    /// <summary>截圖 base64（客戶留 follow-up 時可附；Claude 通常不附）</summary>
+    [Column("ScreenshotB64")]
+    public string? ScreenshotB64 { get; set; }
+
+    [Column("CreatedAt")]
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+    /// <summary>導覽：所屬 thread</summary>
+    [ForeignKey(nameof(ThreadId))]
+    public FeedbackThread? Thread { get; set; }
+}
+
+public static class FeedbackAuthorType
+{
+    public const string Customer = "customer";
+    public const string Claude = "claude";
+}
+
+public static class FeedbackMessageKind
+{
+    /// <summary>客戶留評論（thread 起點）</summary>
+    public const string Comment = "comment";
+
+    /// <summary>Claude 看不懂時的追問</summary>
+    public const string Clarification = "clarification";
+
+    /// <summary>Claude 提出的修改方案（propose mode 用）</summary>
+    public const string Proposal = "proposal";
+
+    /// <summary>客戶在 propose mode 同意修改方案</summary>
+    public const string Approval = "approval";
+
+    /// <summary>Claude 處理完成的告知（含 PR URL）</summary>
+    public const string DoneNote = "done-note";
+}

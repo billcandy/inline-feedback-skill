@@ -1,0 +1,340 @@
+---
+description: 拉客戶在 mockup 上留的 inline 註解，自動 triage 成 PR 或追問
+allowed-tools: Bash, Read, Edit, Write, Grep, Glob, Task
+---
+
+# /triage-feedback — Inline Annotation Feedback Triage
+
+你即將處理客戶留在 NTUST mockup 網站上的 inline 註解。每一筆註解（thread）
+都帶有：CSS selector、outerHTML、四個強訊號（customClasses / visibleText /
+inlineStyle / parentCustomClasses）、客戶留言。
+
+你的工作：把每筆 thread 反查到對應 .razor 元件 → 判斷如何處理 → 直接
+改 code 開 PR、提案、或追問客戶。
+
+> 設計依據：
+> - Phase 0 spike：`docs/feedback-widget-phase0-spike.md`（5/5 命中率，
+>   需照訊號優先序選 selector）
+> - 整體 plan：`~/.claude/plans/image-1-icon-partitioned-hopper.md` Phase 4
+
+---
+
+## Step 0 · 環境檢查
+
+讀 3 個環境變數：
+
+| 變數 | 說明 | 範例 |
+|---|---|---|
+| `FEEDBACK_API_BASE` | API 根 URL | `http://localhost:5000` 或 `https://xxx.up.railway.app` |
+| `FEEDBACK_SERVICE_TOKEN` | 服務端 token，需跟 deploy 環境一致 | 正式 token（64 字元 hex） |
+| `FEEDBACK_AUTOFIX_MODE` | `propose`（預設）或 `direct` | `propose` |
+
+```bash
+echo "API=$FEEDBACK_API_BASE  MODE=${FEEDBACK_AUTOFIX_MODE:-propose}"
+test -n "$FEEDBACK_SERVICE_TOKEN" || echo "❌ 缺 FEEDBACK_SERVICE_TOKEN"
+```
+
+**缺任一變數時，請使用者去 `.claude/settings.local.json` 加 `env` 區塊**
+（Phase 4.6 設計，做一次就好，不用每個 shell 重新 export）：
+
+```json
+{
+  "permissions": { ... 既有設定不動 ... },
+  "env": {
+    "FEEDBACK_API_BASE": "https://ntust-schoolfees-production.up.railway.app",
+    "FEEDBACK_SERVICE_TOKEN": "<貼進 Railway Variables 那串 64 字元 hex>",
+    "FEEDBACK_AUTOFIX_MODE": "propose"
+  }
+}
+```
+
+存檔後**重啟 Claude Code**（cmd+Q 整個關掉再開），新 session 才會載入。
+詳細請看 `docs/feedback-triage-runbook.md` 「客戶端 zero-export 設定」一節。
+
+不要瞎猜 / 不要叫使用者改 slash command 內容。
+
+---
+
+## Step 1 · 拉所有 open / clarification thread
+
+Open = 客戶剛留的；clarification = 客戶補充過、需要再看一次。
+
+```bash
+curl -s -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback?status=open" > /tmp/open_threads.json
+curl -s -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback?status=clarification" > /tmp/clarif_threads.json
+jq '. | length' /tmp/open_threads.json /tmp/clarif_threads.json
+```
+
+兩邊都 0 → 印 `沒有待處理 thread，收工` 然後結束。
+
+---
+
+## Step 1.5 · 列出待處理 + 等使用者挑
+
+**不要直接跑全部** — 拉完 list 後，先印 numbered list 給使用者看，再用
+AskUserQuestion 問要處理哪幾筆。
+
+### 印列表
+
+把 open + clarification 兩個 list 合起來編號，每筆顯示：
+
+```
+要處理的 thread（共 N 筆）：
+
+  1. [處理中]   /cashier/undergrad-system  · 大學部-四學制學雜費設定
+     客戶留言：「字體太小，希望放大」
+     2 分前
+
+  2. [待補充]   /  · NTUST 學雜費管理系統
+     客戶留言：「幫我嘗試一下改動，我想試試看改動的方式」
+     最新追問：「給你 A/B/C/D 4 個方向選一個」
+     12 小時前
+```
+
+組法：
+```bash
+jq -s '[.[][]]' /tmp/open_threads.json /tmp/clarif_threads.json > /tmp/all_threads.json
+# 對每筆做：抓 status / route / signalsJson.pageTitle / messages[-1] body
+# pageTitle: jq -r '.signalsJson | fromjson | .pageTitle // .route' (per thread)
+```
+
+頁面顯示名稱：優先從 `signalsJson.pageTitle` 取（widget 從 `document.title` 送
+上來），沒有就 fallback `route`。
+
+### 用 AskUserQuestion 詢問（4 選項）
+
+- **「全部處理（N 筆）」**：跳到 Step 2 跑全部
+- **「只處理第 1 筆（最新）」**：只跑第 1 筆
+- **「我自己選編號」**：等使用者下一輪 chat 回「1, 3, 5」這種，用 regex
+  `\d+` 抓出來、index 進 list、跑選定的
+- **「取消」**：印 `取消，沒處理任何 thread` 然後結束
+
+對選定的 thread subset 進 Step 2。
+
+---
+
+## Step 2 · 對每筆 thread 跑反查 + 處理
+
+對 `/tmp/open_threads.json` 裡每筆 thread（建議先處理 open，再處理 clarification）：
+
+### 2.1 拉完整 thread
+
+```bash
+TID="<thread id>"
+curl -s -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback/$TID" > /tmp/thread.json
+
+# 抽出最重要的欄位
+jq '{route, selector, outerHtml, signalsJson:(.signalsJson|fromjson), messages:[.messages[]|{author:.authorType,kind,body}]}' /tmp/thread.json
+```
+
+### 2.2 反查 .razor — 照訊號優先序
+
+**Phase 0 spike 證明這個順序最有效，不要瞎 grep**：
+
+| 優先 | 訊號 | grep 策略 |
+|---|---|---|
+| 1 | `customClasses[]`（非 `mud-*`） | `rg -lF '<class>' --glob '*.razor'` |
+| 2 | `visibleText`（≥ 5 字、非純資料） | `rg -lF '<text>' --glob '*.razor'` |
+| 3 | `inlineStyle` 片段 | `rg -lF '<style fragment>' --glob '*.razor'` |
+| 4 | `parentCustomClasses[]` | 同上 |
+
+從第 1 個訊號開始打，**hit ≤ 2 個檔就停**，超過就試下一個訊號。
+全部訊號試完還 ≥ 3 個檔 → 跳到 Step 2.4 (`mark_clarification`)。
+
+```bash
+SIG=$(jq -r '.signalsJson | fromjson' /tmp/thread.json)
+CLASSES=$(jq -r '.signalsJson | fromjson | .customClasses[]' /tmp/thread.json | head -3)
+TEXT=$(jq -r '.signalsJson | fromjson | .visibleText' /tmp/thread.json)
+INLINE=$(jq -r '.signalsJson | fromjson | .inlineStyle' /tmp/thread.json)
+
+cd {{REPO_PATH}}/{{SRC_PATH}}
+for c in $CLASSES; do
+  echo "--- class: $c ---"
+  rg -lF "$c" --glob '*.razor'
+done
+echo "--- text: $TEXT ---"
+[ -n "$TEXT" ] && rg -lF "$TEXT" --glob '*.razor' | head
+```
+
+### 2.3 用 Read 讀候選檔，定位元件
+
+針對 1–2 個候選，用 Read tool 看該檔：找出 selector / visibleText 出現的
+**精確行號**，圈出 component 範圍（一個 `<MudPaper>` 區塊或一個 razor 區段）。
+
+### 2.4 判斷：能改 / 不確定
+
+**能改的判斷準則**：
+- 客戶留言明確（「字太小」「按鈕色不對」「這欄位多餘」）
+- 對應的 .razor 段落清楚
+- 改動範圍 < 30 行
+- 不需要動 schema / migration / 業務邏輯
+
+**不確定 / 需要追問**：
+- 客戶意圖模糊（「這裡怪怪的」「不太對」）
+- 同一 selector 在多處用，不確定客戶指哪個
+- 改動會影響 layout / 其他頁面
+
+**如果不確定 → POST 追問**，跳過此 thread：
+
+```bash
+curl -s -X POST -H "Content-Type: application/json" \
+  -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback/$TID/messages" \
+  -d "$(cat <<JSON
+{"kind":"clarification","body":"<具體問題>，例如：「請問你說的『字太小』是指 KPI 數字（目前 40px）還是 sidebar 字（13px）？另外希望放大到大概什麼級距？」"}
+JSON
+)"
+
+curl -s -X PATCH -H "Content-Type: application/json" \
+  -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback/$TID" \
+  -d '{"status":"clarification"}'
+```
+
+**追問要具體** — 引用客戶的原話 + 指出歧義 + 給 2-3 個選項讓客戶選，不要
+丟一個空白問句。
+
+---
+
+## Step 3 · 動手改（依 mode 分流）
+
+### Propose mode（預設、推薦）
+
+**只貼 markdown Fix Proposal 回 thread，不直接動 code。**
+客戶在 sidebar 看到後 approve（按鈕送 reply 「好」/「ok」/「same」）才動手。
+
+```bash
+PROPOSAL=$(cat <<'MD'
+## 提案：放大 KPI 數字
+
+**檔案**：`NTUST.SchoolFees.Web/wwwroot/css/site.css`
+
+**現況**：`.ds-kpi-value` 是 40px / weight 600 / -1.0px tracking。
+
+**建議改為**：48px / weight 600 / -1.4px tracking（約 +20% 視覺份量）。
+
+```css
+.ds-kpi-value {
+    font-size: 48px;        /* was 40px */
+    letter-spacing: -1.4px; /* was -1.0px */
+}
+```
+
+**影響範圍**：dashboard 4 張 KPI 卡片的數字（學生總數 / 總應收 / 已收 / 未繳）。
+其他頁面沒用到此 class，不影響。
+
+**回 OK / 同意 / yes** 我就直接動手改 + 開 PR。
+MD
+)
+
+curl -s -X POST -H "Content-Type: application/json" \
+  -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback/$TID/messages" \
+  -d "$(jq -n --arg b "$PROPOSAL" '{kind:"proposal", body:$b}')"
+```
+
+不更新 status — 留在 `open`，等客戶回。
+
+### Direct mode
+
+**直接改 code → push → 開 PR → 留 PR url 給客戶確認**（不再自動標 done，
+客戶在 widget 詳情頁按「標記完工」才 done）。
+
+```bash
+git checkout -b "fix/feedback-${TID:0:8}"
+
+# 用 Edit tool 改 code（不要 sed/awk）
+
+cd {{REPO_PATH}}/NTUST.SchoolFees
+dotnet build src/NTUST.SchoolFees.Web/NTUST.SchoolFees.Web.csproj 2>&1 | tail -3
+# 確認 0 errors 才繼續
+
+cd {{REPO_PATH}}
+git add <改動的檔案>
+git commit -m "$(cat <<MSG
+fix(feedback-${TID:0:8}): <一句話描述>
+
+回應客戶 inline annotation thread：${TID:0:8}
+原始留言：<客戶 comment 摘要>
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+MSG
+)"
+git push -u origin "fix/feedback-${TID:0:8}"
+
+PR_URL=$(gh pr create --title "fix: <一句話>" --body "$(cat <<EOM
+## Triggered by inline annotation
+**Thread**: $TID  
+**Route**: <route>  
+**Customer comment**: <comment>
+
+## Change
+<diff summary>
+
+🤖 Auto-triaged by Claude Code via /triage-feedback
+EOM
+)" 2>&1 | tail -1)
+
+# 只更新 pr_url，status 留 'open'。客戶在 widget 詳情頁按「標記完工」才會
+# 標 done。這個設計讓客戶有最後 confirm，不會 Claude 一開 PR 就「完工」。
+curl -s -X PATCH -H "Content-Type: application/json" \
+  -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback/$TID" \
+  -d "$(jq -n --arg p "$PR_URL" '{pr_url:$p}')"
+
+curl -s -X POST -H "Content-Type: application/json" \
+  -H "X-Feedback-Service-Token: $FEEDBACK_SERVICE_TOKEN" \
+  "$FEEDBACK_API_BASE/api/feedback/$TID/messages" \
+  -d "$(jq -n --arg p "$PR_URL" '{kind:"done-note", body:("已開 PR："+$p+"\n\nmerge 後就會 deploy 到正式網站。看完覺得 OK 的話，請按詳情頁的「標記完工」。")}')"
+
+git checkout main
+```
+
+### 處理「客戶 approve proposal」的情況
+
+如果你看到一筆 thread 最新一則是客戶 reply（kind=`comment`）內容像「ok」/
+「同意」/「yes」/「好」，且上面有 Claude 留的 `proposal`，**就把 mode 視為
+direct，依 proposal 的內容動手**（即上面那段流程）。
+
+---
+
+## Step 4 · 印摘要
+
+```
+Triage 完成
+  處理 N 筆 thread
+  ├─ 開 PR     M 個
+  ├─ 提案      P 個（待客戶 approve）
+  └─ 追問      K 個
+
+詳細：
+  - <id1...>  /<route>  → PR <url>
+  - <id2...>  /<route>  → 提案
+  - <id3...>  /<route>  → 追問「<問題摘要>」
+```
+
+---
+
+## 不要做的事
+
+- ❌ 不要直接 push 到 main
+- ❌ 不要動 schema / migration / SeedData / EF Core 設定（範圍超出 inline annotation 應做的事）
+- ❌ 不要 grep 純資料（學院名 / 學生姓名 / 金額）— Phase 0 spike 證明會誤導
+- ❌ 不要丟空白追問（「能再說明嗎？」），追問必須具體 + 給選項
+- ❌ 不要在 thread 還在 `clarification` 狀態時又 POST 追問（會循環）
+- ❌ 不要對同一 thread 連續開兩個 PR
+
+---
+
+## 失敗模式速查
+
+| 情境 | 處置 |
+|---|---|
+| `curl` 拿不到 thread（401/403） | 檢查 `FEEDBACK_SERVICE_TOKEN` 是否正確；token 跟 server 端必須完全一致 |
+| `dotnet build` 失敗 | 不 push、不開 PR；fix 失敗的根因，build 過了再走後續 |
+| `gh pr create` 失敗 | 退回 git，留 thread 在 open 狀態，下次再試 |
+| ripgrep 找到 ≥ 3 個檔，所有訊號都試完 | `mark_clarification` 寫「無法定位元件，能說明你看到的是哪個畫面嗎？」 |
+| 客戶 approve 的 thread 但 proposal 內容無法直接執行（環境變了） | 開新 proposal、不要硬幹 |
