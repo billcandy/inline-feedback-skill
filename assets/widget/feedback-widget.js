@@ -359,10 +359,17 @@
     capturedMeta = null;
   }
 
+  // 只關掉指定的方塊；它若是目前的方塊才清掉全域狀態（避免舊方塊誤關新方塊）
+  function closePopover(el) {
+    el.remove();
+    if (popover === el) { popover = null; capturedMeta = null; }
+  }
+
   // ------------------------------------------------------------------------
   // Annotation mode
   // ------------------------------------------------------------------------
   function enterAnnotationMode() {
+    clearPopover();   // 同一時間只留一個方塊
     state = 'annotating';
     fab.classList.add('active');
     fab.title = '取消註解模式';
@@ -395,6 +402,7 @@
   }
 
   function onKey(e) {
+    if (state === 'submitting') return;
     if (e.key === 'Escape') {
       e.stopPropagation();
       e.preventDefault();
@@ -411,6 +419,7 @@
 
     var el = e.target;
     var rect = el.getBoundingClientRect();
+    clearPopover();
     capturedMeta = {
       session_id: sessionId,
       page_url: location.href,
@@ -428,58 +437,63 @@
     document.documentElement.style.cursor = '';
     document.removeEventListener('mousemove', onMouseMove, true);
     document.removeEventListener('click', onCapture, true);
-    showPopover(rect);
+    showPopover(rect, capturedMeta);
   }
 
   // ------------------------------------------------------------------------
   // Popover with comment input
   // ------------------------------------------------------------------------
-  function showPopover(rect) {
-    popover = document.createElement('div');
-    popover.className = 'popover';
-    var label = capturedMeta.signals.visibleText || capturedMeta.signals.tagName + (capturedMeta.signals.customClasses[0] ? ('.' + capturedMeta.signals.customClasses[0]) : '');
-    popover.innerHTML =
+  // 方塊的按鈕只作用在自己（el）與自己的註解資料（meta），不讀全域 popover / capturedMeta
+  function showPopover(rect, meta) {
+    var el = document.createElement('div');
+    popover = el;
+    el.className = 'popover';
+    var label = meta.signals.visibleText || meta.signals.tagName + (meta.signals.customClasses[0] ? ('.' + meta.signals.customClasses[0]) : '');
+    el.innerHTML =
       '<div class="eyebrow">註解此元素</div>' +
       '<div class="target">' + escapeHtml(label.slice(0, 80)) + '</div>' +
       '<input type="text" class="title-input" placeholder="標題（選填，例「字太小」）" maxlength="100" />' +
       '<textarea placeholder="想改什麼？例如：「這個按鈕字太小，看不清楚」" autofocus></textarea>' +
       '<div class="row">' +
-      '<span class="meta">' + capturedMeta.route + ' · ' + capturedMeta.signals.tagName + '</span>' +
+      '<span class="meta">' + escapeHtml(meta.route) + ' · ' + meta.signals.tagName + '</span>' +
       '<div>' +
       '<button class="btn" data-action="cancel">取消</button>' +
       '<button class="btn btn-primary" data-action="submit" disabled style="margin-left:6px;">送出</button>' +
       '</div>' +
       '</div>';
-    sr.appendChild(popover);
+    sr.appendChild(el);
 
     // 定位：嘗試放元素正下方，超出視窗邊界就往上 / 往左
-    var pop = popover.getBoundingClientRect();
     var left = rect.left;
     var top = rect.bottom + 8;
     if (left + 340 > window.innerWidth - 16) left = window.innerWidth - 340 - 16;
     if (left < 16) left = 16;
     if (top + 200 > window.innerHeight - 16) top = Math.max(16, rect.top - 220);
-    popover.style.left = left + 'px';
-    popover.style.top = top + 'px';
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
 
-    var ta = popover.querySelector('textarea');
-    var submit = popover.querySelector('[data-action=submit]');
-    var cancel = popover.querySelector('[data-action=cancel]');
+    var ta = el.querySelector('textarea');
+    var submit = el.querySelector('[data-action=submit]');
+    var cancel = el.querySelector('[data-action=cancel]');
 
     ta.focus();
     ta.addEventListener('input', function () {
       submit.disabled = ta.value.trim().length === 0;
     });
     cancel.addEventListener('click', function () {
-      clearPopover();
-      exitAnnotationMode();
+      if (state === 'submitting' && popover === el) return;
+      closePopover(el);
+      if (!popover) exitAnnotationMode();
     });
-    var titleInput = popover.querySelector('input.title-input');
+    var titleInput = el.querySelector('input.title-input');
     submit.addEventListener('click', function () {
-      capturedMeta.comment = ta.value.trim();
+      if (state === 'submitting') return;
+      meta.comment = ta.value.trim();
+      if (!meta.comment) return;
       var customTitle = titleInput ? titleInput.value.trim() : '';
-      if (customTitle) capturedMeta.signals.customTitle = customTitle;
-      doSubmit(submit);
+      if (customTitle) meta.signals.customTitle = customTitle;
+      else delete meta.signals.customTitle;
+      doSubmit(el, meta, submit);
     });
   }
 
@@ -492,7 +506,7 @@
   // ------------------------------------------------------------------------
   // Submit
   // ------------------------------------------------------------------------
-  function doSubmit(btn) {
+  function doSubmit(el, meta, btn) {
     state = 'submitting';
     btn.disabled = true;
     btn.textContent = '送出中…';
@@ -501,26 +515,27 @@
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(capturedMeta)
+      body: JSON.stringify(meta)
     })
       .then(function (res) {
         if (!res.ok) throw new Error('HTTP ' + res.status);
         return res.json().catch(function () { return {}; });
       })
       .then(function (data) {
-        clearPopover();
-        clearOutline();
-        exitAnnotationMode();
+        closePopover(el);
+        if (!popover) exitAnnotationMode();   // 送出期間沒開新方塊才結束註解模式
         showToast('已送出註解' + (data && data.id ? '（#' + String(data.id).slice(0, 8) + '）' : ''));
       })
       .catch(function (err) {
-        console.error('[feedback] submit failed', err, capturedMeta);
-        // Phase 1：API 還沒蓋，把 metadata 存到 console + window 上面方便檢查
-        window.__lastFeedbackMeta = capturedMeta;
-        clearPopover();
-        clearOutline();
-        exitAnnotationMode();
-        showToast('送出失敗：' + (err.message || '未知錯誤') + '（已存到 window.__lastFeedbackMeta）', true);
+        console.error('[feedback] submit failed', err, meta);
+        window.__lastFeedbackMeta = meta;
+        // 保留方塊與內容，讓使用者可以再送一次
+        if (el.isConnected) {
+          state = 'popover';
+          btn.disabled = false;
+          btn.textContent = '送出';
+        }
+        showToast('送出失敗：' + (err.message || '未知錯誤') + '，內容還在方塊裡，可以再送一次', true);
       });
   }
 
@@ -1016,8 +1031,9 @@
   // Wire up FABs
   // ------------------------------------------------------------------------
   fab.addEventListener('click', function () {
+    if (state === 'submitting') return;
     if (state === 'idle') enterAnnotationMode();
-    else exitAnnotationMode();
+    else { clearPopover(); exitAnnotationMode(); }
   });
   fabInbox.addEventListener('click', function () {
     if (inbox.open) closeDrawer();
